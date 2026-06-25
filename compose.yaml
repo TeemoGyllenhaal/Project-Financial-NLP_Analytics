@@ -1,18 +1,50 @@
+version: '3.8'
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - PYTHONPATH=/opt/airflow
+    # THÊM DÒNG NÀY ĐỂ SỬA LỖI 403 TRÊN WEB
+    - AIRFLOW__WEBSERVER__SECRET_KEY=dataMiningLab
+    # --- THÊM 2 DÒNG NÀY ĐỂ SỬA LỖI SPARK-SUBMIT ---
+    - SPARK_HOME=/home/airflow/.local/lib/python3.10/site-packages/pyspark
+    - PYSPARK_PYTHON=/usr/local/bin/python
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./bao_cao_daily:/opt/airflow/bao_cao_daily
+    # --- THÊM DÒNG NÀY ĐỂ WEB AIRFLOW HIỂN THỊ ĐƯỢC LOG ---
+    - ./logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
- pyspark-jupyter:
-   image: quay.io/jupyter/pyspark-notebook
-   container_name: pyspark-jupyterNLP
-   ports:
-     - "8888:8888"
-     - "4040:4040"
-   volumes:
-     - ./work:/home/jovyan/work
- minio:
+  # ==========================================
+  # 1. CÁC DỊCH VỤ HIỆN CÓ CỦA BẠN
+  # ==========================================
+  pyspark-jupyter:
+    image: quay.io/jupyter/pyspark-notebook
+    container_name: pyspark-jupyterNLP
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./work:/home/jovyan/work
+      - ./dags:/home/jovyan/dags
+      - ./src:/home/jovyan/src
+      # Thêm thư mục báo cáo vào Jupyter để test thủ công
+      - ./bao_cao_daily:/home/jovyan/bao_cao_daily 
+
+  minio:
     image: minio/minio
     container_name: minio-NLPstorage
     ports:
-      - "9000:9000" # Cổng API để Spark kết nối
-      - "9001:9001" # Cổng giao diện Web (Console)
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: dataNLPmining-lab
       MINIO_ROOT_PASSWORD: dataNLPmining-lab
@@ -20,4 +52,52 @@ services:
     volumes:
       - ./minio_data:/data
 
+  # ==========================================
+  # 2. CỤM DỊCH VỤ CỦA AIRFLOW
+  # ==========================================
+  postgres:
+    image: postgres:13
+    container_name: postgres-airflow
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    # THÊM DÒNG NÀY ĐỂ POSTGRES KHÔNG BỊ MẤT DATA KHI RESTART
+    volumes:
+      - postgres_data_vol:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: bash -c "airflow db migrate && airflow users create -u admin -p admin -f Admin -l User -r Admin -e admin@example.com"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
       
+volumes:
+  postgres_data_vol:
