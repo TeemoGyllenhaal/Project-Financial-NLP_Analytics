@@ -29,7 +29,6 @@ _logs/
 *.csv
 *.parquet
 *.json
-*.txt
 *.gz
 *.avro
 *.h5

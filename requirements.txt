@@ -1,0 +1,11 @@
+pyspark==3.5.1
+textblob
+nltk
+vaderSentiment
+yfinance
+finnhub-python
+boto3
+pandas
+backtrader
+matplotlib
+spacy
