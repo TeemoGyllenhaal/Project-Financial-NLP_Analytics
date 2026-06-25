@@ -177,8 +177,17 @@ Sử dụng **PySpark** để xử lý song song toàn bộ kho tin tức:
 
 Hai loại trực quan hóa chính sau khi LDA chạy xong:
 
-- **WordCloud**: Hiển thị tần suất từ khóa nổi bật theo từng chủ đề.
-- **pyLDAvis**: Biểu đồ tương tác hiển thị khoảng cách giữa các chủ đề (inter-topic distance map), cho phép khám phá từ khóa đặc trưng của từng nhóm.
+#### 🌐 pyLDAvis — Inter-topic Distance Map
+
+Biểu đồ tương tác hiển thị **khoảng cách giữa các chủ đề** trên không gian 2 chiều (PCA/t-SNE). Mỗi vòng tròn là một chủ đề, kích thước thể hiện tỷ trọng, khoảng cách thể hiện sự tương đồng. Bên phải hiển thị các từ khóa đặc trưng của chủ đề đang chọn.
+
+![pyLDAvis Inter-topic Distance Map](docs/images/pyLDAvis.png)
+
+#### ☁️ WordCloud — Từ khóa Nổi bật
+
+Hiển thị tần suất từ khóa xuất hiện trong toàn bộ corpus tin tức tài chính. Từ càng lớn và đậm nghĩa là xuất hiện càng nhiều, giúp nhận diện nhanh các chủ đề và từ ngữ chi phối thị trường.
+
+![WordCloud Tài chính](docs/images/wordcloud.png)
 
 ---
 
