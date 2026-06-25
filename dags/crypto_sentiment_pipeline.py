@@ -20,7 +20,7 @@ default_args = {
 # ==========================================
 # schedule_interval: '0 17 * * *' nghĩa là chạy vào 17:00 (5h chiều) mỗi ngày
 dag = DAG(
-    dag_id='crypto_sentiment_trading_pipeline',
+    dag_id='crypto_sentiment_trading_pipeline_2',
     default_args=default_args,
     description='Pipeline tự động Cào dữ liệu -> NLP -> Chấm điểm -> Trading',
     schedule_interval='0 17 * * *', 
@@ -63,6 +63,14 @@ lda_task = BashOperator(
     dag=dag,
 )
 
+# Task 4.5: Vẽ Wordcloud và pyLDAvis
+viz_task = BashOperator(
+    task_id='visualize',
+    bash_command='python /opt/airflow/src/visualizer/wordCloud_pyLDAvis.py {{ ds }}',
+    dag=dag,
+)
+
+
 # Task 5: Tạo tín hiệu Mua/Bán (Signal)
 signal_task = BashOperator(
     task_id='generate_trading_signals',
@@ -78,18 +86,13 @@ backtest_task = BashOperator(
 )
 
 # ==========================================
-# 4. THIẾT LẬP THỨ TỰ CHẠY (DEPENDENCIES)
+# 4. THIẾT LẬP THỨ TỰ CHẠY (NỐI DÒNG)
 # ==========================================
-# Dấu >> dùng để chỉ định task nào chạy trước, task nào chạy sau.
-# Các task trong ngoặc vuông [...] sẽ được chạy song song cùng lúc.
 
 crawl_task >> nlp_process_task
 
-# Sau khi làm sạch NLP xong, rẽ làm 2 nhánh chạy song song để tiết kiệm thời gian:
-nlp_process_task >> [sentiment_task, lda_task]
-
-# Chỉ khi nào chấm điểm Sentiment xong, mới được phép tạo Tín hiệu và Trade:
-sentiment_task >> signal_task >> backtest_task
-
-# (Optional) Nếu code signal của bạn cần cả kết quả LDA, bạn có thể gộp lại:
-# [sentiment_task, lda_task] >> signal_task >> backtest_task
+# Sau khi NLP xong, rẽ nhánh:
+# Nhánh 1: Sentiment -> Signal -> Backtest
+# Nhánh 2: LDA -> Visualize
+nlp_process_task >> sentiment_task >> signal_task >> backtest_task
+nlp_process_task >> lda_task >> viz_task

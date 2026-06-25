@@ -9,3 +9,6 @@ pandas
 backtrader
 matplotlib
 spacy
+wordcloud
+pyLDAvis
+scikit-learn

@@ -1,29 +1,36 @@
 import os
 import sys
-import re
 import numpy as np
 from datetime import datetime
+from itertools import chain
 
 # ==========================================
 # FIX LỖI: ÉP HỆ THỐNG DÙNG PYSPARK 3.5.1
 # ==========================================
-conda_site_packages = "/opt/conda/lib/python3.13/site-packages"
-if conda_site_packages not in sys.path:
-    sys.path.insert(0, conda_site_packages)
-sys.path = [p for p in sys.path if "/usr/local/spark" not in p]
+modules_to_remove = [mod for mod in sys.modules if mod.startswith('pyspark') or mod.startswith('py4j')]
+for mod in modules_to_remove: 
+    del sys.modules[mod]
 
-os.environ["SPARK_HOME"] = os.path.join(conda_site_packages, "pyspark")
-os.environ["PYSPARK_PYTHON"] = "python3"
-os.environ["PYSPARK_DRIVER_PYTHON"] = "python3"
+sys.path = [p for p in sys.path if "/usr/local/spark" not in p]
+if "PYTHONPATH" in os.environ: 
+    del os.environ["PYTHONPATH"]
+    
+airflow_site_packages = "/home/airflow/.local/lib/python3.10/site-packages"
+if airflow_site_packages not in sys.path: 
+    sys.path.insert(0, airflow_site_packages)
+    
+os.environ["SPARK_HOME"] = os.path.join(airflow_site_packages, "pyspark")
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 # ==========================================
 # IMPORT THƯ VIỆN SPARK & ML
 # ==========================================
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf, concat_ws, split
-from pyspark.sql.types import IntegerType, StringType
+from pyspark.sql.functions import col, concat_ws, split, expr, create_map, lit
 from pyspark.ml.feature import CountVectorizer
 from pyspark.ml.clustering import LDA
+from pyspark.ml.functions import vector_to_array  # <-- THÊM IMPORT NÀY
 
 # ==========================================
 # CẤU HÌNH THỜI GIAN & MINIO
@@ -41,7 +48,7 @@ SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "dataNLPmining-lab")
 BUCKET_NAME = "raw-financial-data"
 
 spark = SparkSession.builder \
-    .appName(f"LDA_Topic_Modeling_{RUN_DATE.replace('/', '_')}") \
+    .appName(f"LDA_Topic_Modeling_By_Ticker_{RUN_DATE.replace('/', '_')}") \
     .config("spark.driver.memory", "4g") \
     .config("spark.executor.memory", "4g") \
     .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0") \
@@ -60,97 +67,126 @@ spark = SparkSession.builder \
 # ==========================================
 # CẤU HÌNH THAM SỐ LDA
 # ==========================================
-NUM_TOPICS = 10        # Số lượng chủ đề
+NUM_TOPICS = 10        # Số lượng chủ đề kỳ vọng
 MAX_ITER = 20          # Số vòng lặp huấn luyện
 NUM_KEYWORDS = 5       # Số lượng từ khóa tóm tắt
 
 def run_lda_pipeline():
-    # 1. Bảng dữ liệu đầu vào (Lấy từ bảng Sentiment tổng hợp ở bước trước)
-    # LƯU Ý: Nếu tên bảng của bạn khác, hãy sửa ở đây
     input_table = "my_catalog.processed_zone.comprehensive_sentiment_scores"
-    output_table = "my_catalog.processed_zone.news_lda_summarized"
     
     try:
         df = spark.read.table(input_table)
-        
-        # Chỉ lấy dữ liệu của ngày hôm nay nếu chạy Daily
-        # df = df.filter(col("published_at").cast("date") == RUN_DATE.replace("/", "-"))
-        
-        # Lọc bỏ dòng rỗng
         df = df.dropna(subset=["vd_comp_title_token", "vd_comp_summary_token"])
         
-        print("\n--- 1. Tiền xử lý văn bản ---")
-        # Gộp title và summary lại, sau đó split thành mảng (ArrayType) để đưa vào CountVectorizer
+        # Tiền xử lý văn bản chung cho toàn bộ DataFrame
         df = df.withColumn("combined_tokens_str", concat_ws(" ", col("vd_comp_title_token"), col("vd_comp_summary_token")))
         df = df.withColumn("tokens_array", split(col("combined_tokens_str"), " "))
-
-        print("\n--- 2. Tạo CountVectorizer (Ma trận tần suất từ) ---")
-        cv = CountVectorizer(inputCol="tokens_array", outputCol="features", vocabSize=10000, minDF=2.0)
-        cv_model = cv.fit(df)
-        df_features = cv_model.transform(df)
-        vocab = cv_model.vocabulary
-
-        print(f"\n--- 3. Bắt đầu huấn luyện LDA với {NUM_TOPICS} Chủ đề ---")
-        lda = LDA(k=NUM_TOPICS, maxIter=MAX_ITER, featuresCol="features")
-        lda_model = lda.fit(df_features)
-
-        print("\n--- 4. Trích xuất từ khóa cho từng Chủ đề ---")
-        topics = lda_model.describeTopics(maxTermsPerTopic=NUM_KEYWORDS).collect()
-        topic_summary_dict = {}
         
-        for row in topics:
-            topic_id = row['topic']
-            words = [vocab[idx] for idx in row['termIndices']]
-            topic_summary_dict[topic_id] = ", ".join(words)
-            print(f"   Chủ đề {topic_id}: {topic_summary_dict[topic_id]}")
+        # 1. Lấy danh sách tất cả các mã (tickers) có trong dữ liệu
+        print("\n--- 1. Quét danh sách các mã cổ phiếu (Tickers) ---")
+        distinct_tickers_rows = df.select("ticker").distinct().collect()
+        tickers_list = [row['ticker'] for row in distinct_tickers_rows if row['ticker'] is not None]
+        print(f"📌 Tìm thấy {len(tickers_list)} mã cổ phiếu cần xử lý.")
 
-        print("\n--- 5. Phân loại bài báo và gắn Tóm tắt ---")
-        df_result = lda_model.transform(df_features)
+        final_result_df = None # DataFrame lưu trữ tổng hợp kết quả của tất cả các mã
 
-        # UDF Lấy ID chủ đề chiếm tỷ trọng cao nhất
-        @udf(returnType=IntegerType())
-        def get_dominant_topic(topic_distribution):
-            return int(np.argmax(topic_distribution))
+        # 2. Vòng lặp huấn luyện LDA cho TỪNG MÃ CỔ PHIẾU
+        for idx, current_ticker in enumerate(tickers_list, 1):
+            print(f"\n[{idx}/{len(tickers_list)}] 🚀 Đang xử lý LDA cho mã: {current_ticker}")
+            
+            # Lọc dữ liệu theo mã hiện tại
+            df_ticker = df.filter(col("ticker") == current_ticker)
+            doc_count = df_ticker.count()
+            
+            # Bỏ qua nếu mã này có quá ít bài viết (không đủ để gom cụm)
+            if doc_count < 5:
+                print(f"   ⚠️ Bỏ qua {current_ticker} vì chỉ có {doc_count} bài viết (cần tối thiểu 5).")
+                continue
+            
+            # Tự động giảm số lượng Topic nếu số lượng bài báo ít hơn NUM_TOPICS
+            actual_k = min(NUM_TOPICS, doc_count // 2)
+            actual_k = max(2, actual_k) # Đảm bảo có ít nhất 2 cụm
 
-        # UDF Lấy từ khóa tóm tắt
-        @udf(returnType=StringType())
-        def get_topic_summary(topic_id):
-            return topic_summary_dict.get(topic_id, "Không xác định")
+            # Tạo CountVectorizer
+            cv = CountVectorizer(inputCol="tokens_array", outputCol="features", vocabSize=5000, minDF=1.0)
+            cv_model = cv.fit(df_ticker)
+            df_features = cv_model.transform(df_ticker)
+            vocab = cv_model.vocabulary
 
-        # Áp dụng hàm
-        df_result = df_result.withColumn("dominant_topic_id", get_dominant_topic(col("topicDistribution")))
-        df_result = df_result.withColumn("lda_summary_keywords", get_topic_summary(col("dominant_topic_id")))
+            # Huấn luyện LDA
+            lda = LDA(k=actual_k, maxIter=MAX_ITER, featuresCol="features")
+            lda_model = lda.fit(df_features)
 
-        # --- LƯU Ý QUAN TRỌNG VỀ TÊN CHỦ ĐỀ (HARDCODE) ---
-        # Tên chủ đề được gán cứng dựa trên kết quả chạy thử nghiệm trước đây.
-        # Khi chạy trên dữ liệu mới mỗi ngày, mô hình có thể tự định nghĩa lại chủ đề khác đi.
-        topic_names_dict = {
-            0: "Cổ phiếu Cổ tức & Tăng trưởng",
-            1: "Xu hướng AI & Vốn hóa tỷ đô",
-            2: "So sánh Năng lực Cạnh tranh",
-            3: "Phân tích Biến động Giá Cổ phiếu",
-            4: "Chỉ số Vĩ mô & Hàng hóa",
-            5: "Khuyến nghị từ Chuyên gia",
-            6: "Đầu tư Năng lượng & Công nghệ Mới",
-            7: "Tin tức Sự kiện & Ra mắt trong ngày",
-            8: "Tác động của Yếu tố Chính trị - Vĩ mô",
-            9: "Mùa Báo cáo Tài chính Quý"
-        }
+            # Trích xuất từ khóa cho từng Chủ đề
+            topics = lda_model.describeTopics(maxTermsPerTopic=NUM_KEYWORDS).collect()
+            topic_summary_dict = {}
+            for row in topics:
+                topic_id = row['topic']
+                words = [vocab[idx] for idx in row['termIndices']]
+                topic_summary_dict[topic_id] = ", ".join(words)
+            
+            # Phân loại bài báo
+            df_ticker_result = lda_model.transform(df_features)
 
-        @udf(returnType=StringType())
-        def get_topic_name(topic_id):
-            return topic_names_dict.get(topic_id, "Chủ đề Khác")
+            # =========================================================================
+            # KỸ THUẬT NÂNG CAO: Thay thế UDF bằng Native Spark SQL để tránh lỗi Closure
+            # =========================================================================
+            
+            # BƯỚC 1: Ép kiểu Vector sang Array thuần túy
+            df_ticker_result = df_ticker_result.withColumn(
+                "topicDistributionArray", 
+                vector_to_array(col("topicDistribution"))
+            )
 
-        df_result = df_result.withColumn("topic_name", get_topic_name(col("dominant_topic_id")))
+            # BƯỚC 2: Lấy ID của topic có xác suất cao nhất từ mảng vừa tạo
+            df_ticker_result = df_ticker_result.withColumn(
+                "dominant_topic_id", 
+                expr("array_position(topicDistributionArray, array_max(topicDistributionArray)) - 1")
+            )
 
-        # Xóa các cột trung gian nặng nề của ML để tiết kiệm ổ cứng
-        df_final = df_result.drop("combined_tokens_str", "tokens_array", "features", "topicDistribution")
+            # Map Topic ID sang danh sách từ khóa mà không cần dùng UDF
+            mapping_expr = create_map([lit(x) for x in chain(*topic_summary_dict.items())])
+            df_ticker_result = df_ticker_result.withColumn(
+                "lda_summary_keywords", 
+                mapping_expr[col("dominant_topic_id")]
+            )
+            
+            # Vì ta không dùng dictionary cố định nữa, topic_name sẽ lấy luôn các từ khóa chính
+            df_ticker_result = df_ticker_result.withColumn(
+                "topic_name", 
+                concat_ws(" - ", lit("Chủ đề"), col("dominant_topic_id"), col("lda_summary_keywords"))
+            )
 
-        print(f"\n⏳ Đang ghi dữ liệu vào Apache Iceberg: {output_table} ...")
-        # Dùng 'append' nếu chạy daily, hoặc 'overwrite' nếu đang test toàn bộ
-        df_final.write.format("iceberg").mode("append").saveAsTable(output_table)
+            # Dọn dẹp các cột trung gian
+            df_ticker_result = df_ticker_result.drop("features", "topicDistribution", "topicDistributionArray")
+            
+            # Nối (Union) kết quả của mã hiện tại vào DataFrame tổng
+            if final_result_df is None:
+                final_result_df = df_ticker_result
+            else:
+                final_result_df = final_result_df.unionByName(df_ticker_result)
 
-        print("🎉 HOÀN TẤT LDA CHẠY TỰ ĐỘNG!")
+        # 3. Ghi dữ liệu vào Apache Iceberg MỘT LẦN DUY NHẤT VỚI PARTITION
+        if final_result_df is not None:
+            # 💡 CHỈ CHỌN NHỮNG CỘT CẦN THIẾT ĐỂ TRÁNH LỖI SCHEMA MISMATCH
+            final_df_to_save = final_result_df.select(
+                "ticker", "id", "published_at", "title", "summary",
+                "dominant_topic_id", "lda_summary_keywords", "topic_name"
+            )
+            
+            print(f"\n⏳ Đang ghi {final_df_to_save.count()} dòng dữ liệu tổng hợp vào Apache Iceberg...")
+            print("🗂️ Chế độ lưu: Phân vùng tách biệt theo từng Ticker (partitionBy).")
+            
+            # Đổi tên bảng thành 'daily_news_topics_final' để tạo khuôn mới
+            final_df_to_save.write \
+                .format("iceberg") \
+                .partitionBy("ticker") \
+                .mode("append") \
+                .saveAsTable("my_catalog.processed_zone.daily_news_topics_final")
+                
+            print("🎉 HOÀN TẤT LDA CHẠY TỰ ĐỘNG THEO TỪNG MÃ VÀ ĐÃ LƯU VÀO MINIO!")
+        else:
+            print("⚠️ Không có dữ liệu hợp lệ nào được xử lý.")
         
     except Exception as e:
         print(f"❌ Lỗi khi chạy LDA Pipeline: {e}")
