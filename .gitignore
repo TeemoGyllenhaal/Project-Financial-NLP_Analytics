@@ -42,7 +42,7 @@ data/
 minio_data/
 db_data/
 spark_data/
-
+bao_cao_daily/
 # =========================
 # OS & IDE
 # =========================

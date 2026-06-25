@@ -7,13 +7,11 @@ import pandas as pd
 import requests
 import finnhub
 import os
-import sys
 import re
 from datetime import datetime, timedelta
 from botocore.client import Config
 
 # IMPORT CẤU HÌNH TỪ FILE SETTINGS
-# Đảm bảo bạn đã thêm thư mục gốc vào sys.path nếu cần thiết
 from src.config.setting import settings
 
 # ==========================================
@@ -31,20 +29,14 @@ s3_client = boto3.client(
 # ==========================================
 # CẤU HÌNH FINNHUB API
 # ==========================================
-# Khuyên dùng: Nên thêm API_KEY vào settings.py thay vì để lộ trong code
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d8p78f9r01qp954vlhggd8p78f9r01qp954vlhh0")
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
 # ==========================================
-# HÀM LƯU TRỮ VÀO MINIO (DÙNG SETTINGS)
+# HÀM LƯU TRỮ VÀO MINIO
 # ==========================================
 def upload_to_minio(data, folder, ticker):
-    # Lấy ngày từ tham số dòng lệnh hoặc mặc định là hôm nay
     run_date = sys.argv[1].replace("-", "/") if len(sys.argv) > 1 else datetime.now().strftime("%Y/%m/%d")
-    
-    # Sử dụng các đường dẫn đã khai báo trong settings
-    # Lưu ý: RAW_NEWS_PATH và RAW_MARKET_PATH đã bao gồm cấu trúc s3a://...
-    # Chúng ta cần tách phần path để phù hợp với s3_client.put_object
     object_key = f"raw_zone_finnhub_daily/{folder}/{run_date}/{ticker}.json" 
     
     json_bytes = json.dumps(data, ensure_ascii=False, default=str).encode('utf-8')
@@ -60,33 +52,37 @@ def upload_to_minio(data, folder, ticker):
         print(f"   -> ❌ Lỗi upload lên MinIO: {e}")
 
 # ==========================================
-# HÀM CÀO DỮ LIỆU DAILY (1 NGÀY)
+# HÀM CÀO DỮ LIỆU (20 NGÀY)
 # ==========================================
-def crawl_stock_price_daily(ticker_symbol):
-    print(f"⏳ Đang cào dữ liệu GIÁ (1 ngày) cho mã {ticker_symbol}...")
+def crawl_stock_price_20days(ticker_symbol):
+    print(f"⏳ Đang cào dữ liệu GIÁ (20 ngày gần nhất) cho mã {ticker_symbol}...")
+    
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=20)
+    
     ticker = yf.Ticker(ticker_symbol)
-    # Rút ngắn period từ 1y xuống 1d
-    df = ticker.history(period="1d", interval="1d")
+    df = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval="1d")
+    
     if df.empty:
         return
+        
     df.reset_index(inplace=True)
     df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
     upload_to_minio(data=df.to_dict(orient="records"), folder="market_data", ticker=ticker_symbol)
 
-def crawl_stock_news_finnhub_daily(ticker_symbol):
-    print(f"📰 Đang cào dữ liệu TIN TỨC (1 ngày) cho mã {ticker_symbol}...")
+def crawl_stock_news_finnhub_20days(ticker_symbol):
+    print(f"📰 Đang cào dữ liệu TIN TỨC (20 ngày gần nhất) cho mã {ticker_symbol}...")
     
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=1) # Chỉ lùi về 1 ngày trước
+    start_date = end_date - timedelta(days=20) # Lấy dữ liệu 20 ngày
     
     _from = start_date.strftime("%Y-%m-%d")
     _to = end_date.strftime("%Y-%m-%d")
     
     try:
-        # Gọi API 1 lần duy nhất, không cần vòng lặp chunk 30 ngày
         news = finnhub_client.company_news(ticker_symbol, _from=_from, to=_to)
         if not news:
-            print(f"   -> ℹ️ Không có tin tức mới cho {ticker_symbol} trong ngày qua.")
+            print(f"   -> ℹ️ Không có tin tức mới cho {ticker_symbol} trong 20 ngày qua.")
             return
             
         print(f"   -> Đã lấy được {len(news)} bài báo cho {ticker_symbol}.")
@@ -94,6 +90,7 @@ def crawl_stock_news_finnhub_daily(ticker_symbol):
         
     except Exception as e:
         print(f"   -> ❌ Lỗi gọi API Finnhub cho {_from} đến {_to}: {e}")
+        raise e # Re-raise để khối try-except bên ngoài bắt được mã lỗi 429 nếu có
 
 # ==========================================
 # HÀM LẤY DANH SÁCH MÃ S&P 500
@@ -115,31 +112,38 @@ def get_sp500_tickers():
 # KHỐI THỰC THI CHÍNH
 # ==========================================
 if __name__ == "__main__":
-    print(f"=== BẮT ĐẦU CHẠY PIPELINE DAILY VÀO BUCKET: {settings.BUCKET_NAME} ===")
+    print(f"=== BẮT ĐẦU CHẠY PIPELINE (20 DAYS) VÀO BUCKET: {settings.BUCKET_NAME} ===")
     
     danh_sach_ma = get_sp500_tickers()
-    
-    # LƯU Ý: Khuyến nghị chạy thử với 3-5 mã trước khi cào toàn bộ 500 mã
-    # danh_sach_ma = danh_sach_ma[:5] 
-    
     print(f"Tổng cộng có {len(danh_sach_ma)} mã cổ phiếu sẽ được cào.")
+    
+    # Số giây tối thiểu cần thiết cho mỗi mã để đảm bảo an toàn API Finnhub (60 requests / 60 seconds)
+    # Cài đặt ở mức 1.05 giây để an toàn tuyệt đối, tránh burst limit
+    SAFE_DELAY_PER_TICKER = 1.05 
     
     for i, ma in enumerate(danh_sach_ma):
         print(f"\n--- Đang xử lý mã thứ {i+1}/{len(danh_sach_ma)}: {ma} ---")
+        start_time = time.time()
+        
         try:
-            crawl_stock_price_daily(ma)
-            time.sleep(1) 
+            # 1. Cào Giá
+            crawl_stock_price_20days(ma)
             
-            crawl_stock_news_finnhub_daily(ma)
+            # 2. Cào Tin tức
+            crawl_stock_news_finnhub_20days(ma)
             
-            # API Finnhub Free giới hạn 60 request/phút. 
-            # Mỗi mã gọi 1 API news -> 12 giây nghỉ đảm bảo an toàn tuyệt đối.
-            print("   -> ⏳ Đang đợi 2 giây để tránh bị khóa API...")
-            time.sleep(2) 
-            
+            # 3. Tính toán độ trễ động (Dynamic Delay)
+            elapsed_time = time.time() - start_time
+            if elapsed_time < SAFE_DELAY_PER_TICKER:
+                sleep_time = SAFE_DELAY_PER_TICKER - elapsed_time
+                print(f"   -> ⚡ Đã xử lý trong {elapsed_time:.2f}s. Tự động đợi thêm {sleep_time:.2f}s để tối ưu rate limit...")
+                time.sleep(sleep_time)
+            else:
+                print(f"   -> ⚡ Đã xử lý trong {elapsed_time:.2f}s. Không cần đợi thêm.")
+                
         except finnhub.FinnhubAPIException as e:
             if 'rate limit' in str(e).lower() or '429' in str(e):
-                print("   -> ⚠️ Chạm ngưỡng API! Tạm dừng hệ thống 60 giây...")
+                print("   -> ⚠️ Chạm ngưỡng API Finnhub! Tạm dừng hệ thống 60 giây...")
                 time.sleep(60)
             else:
                 print(f"   -> ❌ Lỗi API không xác định với mã {ma}: {e}")
@@ -147,4 +151,4 @@ if __name__ == "__main__":
             print(f"   -> ❌ Lỗi hệ thống với mã {ma}: {e}")
             continue 
             
-    print("\n🎉 HOÀN TẤT CÀO TOÀN BỘ DỮ LIỆU DAILY!")
+    print("\n🎉 HOÀN TẤT CÀO TOÀN BỘ DỮ LIỆU 20 NGÀY!")
